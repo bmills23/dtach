@@ -15,6 +15,12 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+/*
+    Modifications Copyright (C) 2026 Bryan Mills
+    - Added scrollback_size global and DEFAULT_SCROLLBACK_SIZE constant
+    - Added MSG_CONTENT enum value
+    See https://github.com/bmills23/dtach-rev for details.
+*/
 #ifndef dtach_h
 #define dtach_h
 

@@ -15,6 +15,12 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+/*
+    Modifications Copyright (C) 2026 Bryan Mills
+    - Added circular scrollback buffer for session reconnection context
+    - Added OSC-delimited replay on client attach
+    See https://github.com/bmills23/dtach-rev for details.
+*/
 #include "dtach.h"
 
 /* The pty struct - The pty information is stored here. */

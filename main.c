@@ -15,6 +15,12 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+/*
+    Modifications Copyright (C) 2026 Bryan Mills
+    - Added -b flag for configurable scrollback buffer size
+    - Added scrollback_size global initialization
+    See https://github.com/bmills23/dtach-rev for details.
+*/
 #include "dtach.h"
 
 /*
