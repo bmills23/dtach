@@ -217,6 +217,14 @@ fire_idle_callback(int idle_secs)
 	setenv("DTACH_EVENT", "idle", 1);
 	setenv("DTACH_LAST_OUTPUT", lastoutput_path, 1);
 
+	/* Expose the child (shell) PID so the callback can inspect
+	   the process tree to detect running AI tools. */
+	{
+		char pid_str[32];
+		snprintf(pid_str, sizeof(pid_str), "%d", (int)the_pty.pid);
+		setenv("DTACH_CHILD_PID", pid_str, 1);
+	}
+
 	/* Redirect stdio to /dev/null. */
 	nullfd = open("/dev/null", O_RDWR);
 	if (nullfd >= 0)
