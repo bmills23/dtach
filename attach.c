@@ -33,6 +33,60 @@ static struct termios cur_term;
 /* 1 if the window size changed */
 static int win_changed;
 
+/*
+** The markers the master brackets a scrollback replay with. A replay is the
+** one thing the master can cut short without the session being over: it
+** drops a client that stalls or trickles rather than letting it hold the
+** session, and a dropped client just sees its socket close. EOF alone would
+** be reported as "dtach terminating", telling the user the session is gone
+** while the master is still running it, so track whether we are between the
+** two markers and say something true instead.
+*/
+static const char replay_start_marker[] = "\033]dtach-rev;replay-start\007";
+static const char replay_end_marker[] = "\033]dtach-rev;replay-end\007";
+/* 1 while a replay-start has been seen with no replay-end after it. */
+static int in_replay;
+
+/*
+** Advance a naive matcher for `marker` over `len` bytes, returning 1 if the
+** marker completed somewhere in them. The match state lives in *pos across
+** calls, so a marker split across two reads is still seen.
+*/
+static int
+scan_marker(const char *marker, size_t *pos, const unsigned char *buf,
+	    size_t len)
+{
+	size_t i;
+	int matched = 0;
+
+	for (i = 0; i < len; ++i)
+	{
+		if (buf[i] == (unsigned char)marker[*pos])
+		{
+			if (marker[++(*pos)] == '\0')
+			{
+				matched = 1;
+				*pos = 0;
+			}
+		}
+		else
+			*pos = (buf[i] == (unsigned char)marker[0]) ? 1 : 0;
+	}
+	return matched;
+}
+
+/* Note the replay markers in a chunk of data received from the master. */
+static void
+track_replay(const unsigned char *buf, size_t len)
+{
+	static size_t start_pos, end_pos;
+
+	if (scan_marker(replay_start_marker, &start_pos, buf, len))
+		in_replay = 1;
+	if (scan_marker(replay_end_marker, &end_pos, buf, len))
+		in_replay = 0;
+}
+
 /* Restores the original terminal settings. */
 static void
 restore_term(void)
@@ -252,6 +306,17 @@ attach_main(int noerror)
 
 			if (len == 0)
 			{
+				/* Cut off mid-replay: the master dropped
+				** us, but the session is still running. */
+				if (in_replay)
+				{
+					printf(EOS "\r\n"
+					       "\033]dtach-rev;replay-abort\007"
+					       "[reattach interrupted - the "
+					       "session is still running, "
+					       "attach again]\r\n");
+					exit(1);
+				}
 				printf(EOS "\r\n[EOF - dtach terminating]"
 				       "\r\n");
 				exit(0);
@@ -262,6 +327,7 @@ attach_main(int noerror)
 				exit(1);
 			}
 			/* Send the data to the terminal. */
+			track_replay(buf, (size_t)len);
 			write_buf_or_fail(1, buf, len);
 			n--;
 		}

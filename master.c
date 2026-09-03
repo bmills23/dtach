@@ -104,30 +104,178 @@ scrollback_push(const unsigned char *buf, size_t len)
 	}
 }
 
-/* Replay the scrollback buffer contents to a file descriptor. */
-static void
-scrollback_replay(int fd)
+/*
+** How long to wait, in seconds, for a stalled client to accept more data
+** before giving up on it. This bounds a single wait.
+*/
+#define CLIENT_WRITE_TIMEOUT 10
+
+/*
+** How long a whole scrollback replay may take. The per-wait bound above is
+** not enough on its own: every partial drain starts a fresh wait, so a
+** client that reads just fast enough to stay writable could hold the master
+** inside client_activity for (scrollback size / socket buffer) times
+** CLIENT_WRITE_TIMEOUT, which is hours for a 16MB scrollback. One deadline
+** for the whole replay bounds that.
+**
+** The rule: a replay gets CLIENT_REPLAY_TIMEOUT seconds of grace plus
+** however long the data itself would take at CLIENT_REPLAY_MIN_RATE bytes
+** per second, so the deadline scales with the amount actually being sent:
+**
+**     deadline = start + CLIENT_REPLAY_TIMEOUT
+**                      + bytes_to_replay / CLIENT_REPLAY_MIN_RATE
+**
+** A fixed deadline would punish a healthy client purely for having a large
+** scrollback; a minimum sustained rate only punishes a client that cannot
+** keep up. The two bounds cover different failures: a client that stops
+** reading entirely is still dropped quickly by the per-wait bound, while
+** the total deadline drops only a client that trickles below the minimum
+** rate for the whole transfer.
+**
+** The trade-off: while a replay runs the pty is unread and other clients
+** get nothing, so a genuinely slow link can hold the master for up to
+** CLIENT_REPLAY_TIMEOUT plus size at the minimum rate. At 64KB/s that is
+** about four and a half minutes for a full 16MB scrollback. A client that
+** cannot keep up even with that is dropped, and the session lives on.
+*/
+#define CLIENT_REPLAY_TIMEOUT 30
+#define CLIENT_REPLAY_MIN_RATE (64 * 1024)
+
+/*
+** Ceiling on the scaled term, in seconds. The scrollback size is whatever
+** -b said, and main.c puts no upper bound on it, so the scaled term is not
+** self-limiting: -b 1024m would allow 16384 seconds, and one client
+** trickling just above the minimum rate would hold the master, the pty
+** child (blocked on write once the pty buffer fills) and every other
+** attached client for four and a half hours. The cap is the scaled term for
+** a 16MB scrollback, the largest size we ship, so every supported size
+** keeps its full scaled deadline and only the outsized ones are clamped.
+*/
+#define CLIENT_REPLAY_MAX_SCALED ((16 * 1024 * 1024) / CLIENT_REPLAY_MIN_RATE)
+
+/*
+** Write buf to a client's file descriptor, waiting for the descriptor to
+** become writable whenever the socket buffer fills up. `deadline` is the
+** absolute time by which the write, and any larger transfer it belongs to,
+** must be finished.
+**
+** Returns 0 on success, or -1 if the client should be dropped, which happens
+** when the socket reports a real error, when it stays unwritable for
+** CLIENT_WRITE_TIMEOUT seconds, or when `deadline` passes.
+**
+** Unlike write_buf_or_fail(), this never exits: a client that goes away or
+** stops reading must never take the session down with it. That matters most
+** on attach, where the scrollback replay is easily larger than the socket
+** send buffer (about 8KB on some systems).
+*/
+static int
+client_write(int fd, const void *buf, size_t count, time_t deadline)
+{
+	while (count != 0)
+	{
+		fd_set writefds;
+		struct timeval tv;
+		time_t now;
+		ssize_t ret = write(fd, buf, count);
+
+		if (ret > 0)
+		{
+			buf = (const char *)buf + ret;
+			count -= ret;
+			continue;
+		}
+		else if (ret < 0
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+			 && errno != EWOULDBLOCK
+#endif
+			 && errno != EAGAIN && errno != EINTR)
+			return -1;
+
+		/* We made no progress. Give up if the transfer as a whole has
+		** run out of time, whatever the reason for the stall. */
+		now = time(NULL);
+		if (now >= deadline)
+			return -1;
+		else if (ret < 0 && errno == EINTR)
+			continue;
+
+		/* The socket buffer is full. Wait for the client to drain it,
+		** for no longer than the deadline allows. */
+		FD_ZERO(&writefds);
+		FD_SET(fd, &writefds);
+		tv.tv_sec = deadline - now;
+		if (tv.tv_sec > CLIENT_WRITE_TIMEOUT)
+			tv.tv_sec = CLIENT_WRITE_TIMEOUT;
+		tv.tv_usec = 0;
+		ret = select(fd + 1, NULL, &writefds, NULL, &tv);
+		if (ret < 0 && (errno == EINTR || errno == EAGAIN))
+			continue;
+		else if (ret <= 0)
+			return -1;
+	}
+	return 0;
+}
+
+/* Replay the scrollback buffer contents to a client's file descriptor.
+** Returns 0 on success, or -1 if the client should be dropped. */
+static int
+scrollback_replay(int fd, time_t deadline)
 {
 	size_t start, count;
 
 	if (!scrollback.data || scrollback.used == 0)
-		return;
+		return 0;
 
 	if (scrollback.used < scrollback.size)
 	{
 		/* Buffer hasn't wrapped yet - data starts at 0 */
-		write_buf_or_fail(fd, scrollback.data, scrollback.used);
+		return client_write(fd, scrollback.data, scrollback.used,
+				    deadline);
 	}
 	else
 	{
 		/* Buffer has wrapped - oldest data starts at head */
 		start = scrollback.head;
 		count = scrollback.size - start;
-		if (count > 0)
-			write_buf_or_fail(fd, scrollback.data + start, count);
-		if (start > 0)
-			write_buf_or_fail(fd, scrollback.data, start);
+		if (count > 0 && client_write(fd, scrollback.data + start,
+					      count, deadline) < 0)
+			return -1;
+		if (start > 0 && client_write(fd, scrollback.data, start,
+					      deadline) < 0)
+			return -1;
 	}
+	return 0;
+}
+
+/* The number of scrollback bytes scrollback_replay() will write for an
+** attach happening right now. Both of its branches send exactly `used`
+** bytes: the unwrapped one in a single write, the wrapped one as the tail
+** (size - head) followed by the head, which sums to size, and size equals
+** used once the buffer has wrapped. */
+static size_t
+scrollback_replay_bytes(void)
+{
+	if (!scrollback.data)
+		return 0;
+	return scrollback.used;
+}
+
+/* The absolute time by which a replay started at `started` must be done.
+** See the comment on CLIENT_REPLAY_TIMEOUT for the rule and the trade-off. */
+static time_t
+client_replay_deadline(time_t started)
+{
+	/* size_t division, so no truncation of a large buffer, and the
+	** quotient is tiny: a 16MB scrollback at 64KB/s yields 256, which
+	** fits any time_t with room to spare. */
+	size_t seconds = scrollback_replay_bytes() / CLIENT_REPLAY_MIN_RATE;
+
+	/* -b is unbounded, so clamp: no single client may hold the session
+	** for longer than the largest scrollback we support would justify. */
+	if (seconds > CLIENT_REPLAY_MAX_SCALED)
+		seconds = CLIENT_REPLAY_MAX_SCALED;
+
+	return started + CLIENT_REPLAY_TIMEOUT + (time_t)seconds;
 }
 
 /* Dump the last `max_bytes` of scrollback to a file for the idle callback. */
@@ -575,6 +723,17 @@ control_activity(int s)
 	*(p->pprev) = p;
 }
 
+/* Unlink a client from the list and close it. The session is unaffected. */
+static void
+drop_client(struct client *p)
+{
+	close(p->fd);
+	if (p->next)
+		p->next->pprev = p->pprev;
+	*(p->pprev) = p->next;
+	free(p);
+}
+
 /* Process activity from a client. */
 static void
 client_activity(struct client *p)
@@ -590,11 +749,7 @@ client_activity(struct client *p)
 	/* Close the client on an error. */
 	if (len != sizeof(struct packet))
 	{
-		close(p->fd);
-		if (p->next)
-			p->next->pprev = p->pprev;
-		*(p->pprev) = p->next;
-		free(p);
+		drop_client(p);
 		return;
 	}
 
@@ -616,9 +771,30 @@ client_activity(struct client *p)
 			"\033]dtach-rev;replay-start\007";
 		static const char replay_end[] =
 			"\033]dtach-rev;replay-end\007";
-		write_buf_or_fail(p->fd, replay_start, sizeof(replay_start) - 1);
-		scrollback_replay(p->fd);
-		write_buf_or_fail(p->fd, replay_end, sizeof(replay_end) - 1);
+		time_t started = time(NULL);
+		time_t deadline = client_replay_deadline(started);
+		int failed;
+
+		failed = client_write(p->fd, replay_start,
+				      sizeof(replay_start) - 1, deadline) < 0 ||
+			 scrollback_replay(p->fd, deadline) < 0 ||
+			 client_write(p->fd, replay_end,
+				      sizeof(replay_end) - 1, deadline) < 0;
+
+		/* The replay may have blocked on a slow client, and the pty
+		** went unread for exactly that long. Push the idle clock
+		** forward by the time we could not observe the program, so a
+		** slow reattach is never mistaken for an idle program. */
+		if (idle_timeout > 0 && last_pty_output > 0)
+			last_pty_output += time(NULL) - started;
+
+		if (failed)
+		{
+			/* The client went away or stalled during the replay.
+			** Drop just that client; the session lives on. */
+			drop_client(p);
+			return;
+		}
 		p->attached = 1;
 	}
 	else if (pkt.type == MSG_DETACH)
