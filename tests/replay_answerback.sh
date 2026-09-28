@@ -12,10 +12,11 @@
 # answer ("ESC [ ? 1 ; 2 c") into the session as keystrokes, corrupting the
 # next command.
 #
-# The fix: the attach client drops keyboard input while a non-empty replay is
-# streaming and for a short grace window after its replay-end marker. The
-# replayed bytes still render, and a live query issued after the window is
-# answered and forwarded as before.
+# The fix: from the replay-start of a replay the client asked for until the
+# terminal answers the status query (ESC [ 5 n) the client writes right after
+# the replay, the client drops terminal reports on its input and nothing else.
+# The replayed bytes still render, and a live query issued after the replay is
+# answered and forwarded as before. tests/replay_gate.sh covers the rest.
 #
 # Phases:
 #   1. create a session with -A under a terminal that answers DA1. The program
@@ -24,8 +25,8 @@
 #      client's replay is empty and it is never gated
 #   2. detach, then reattach with -a under a terminal that answers every DA1
 #      it sees, replayed or not. The replayed query is answered, and that
-#      answer must NOT reach the session. Past the grace window, ask the
-#      program to query again: that live answer must reach it
+#      answer must NOT reach the session. After the replay, ask the program
+#      to query again: that live answer must reach it
 #   3. a session with no scrollback (-b 0) has an empty replay: input sent
 #      right after attach, including a live DA1 answer, reaches it unchanged
 #
@@ -203,7 +204,7 @@ if [ "$QPOS" -lt 0 ]; then
 	note_fail "the program never received the live keystroke Q"
 	QPOS=$(filesize "$LOG")
 else
-	note_pass "live keystroke after the grace window reached the program"
+	note_pass "live keystroke after the replay reached the program"
 fi
 STALE=$(count_answers "$LOG" "$PHASE1_END" "$QPOS")
 if [ "$STALE" -eq 0 ]; then
@@ -213,7 +214,7 @@ else
 fi
 LIVE=$(count_answers "$LOG" "$QPOS" end)
 if [ "$LIVE" -eq 1 ]; then
-	note_pass "the live DA1 answer after the window reached the program"
+	note_pass "the live DA1 answer after the replay reached the program"
 else
 	note_fail "the program got $LIVE answers to its live query, want 1"
 fi

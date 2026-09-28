@@ -17,8 +17,15 @@ TARFILES = $(srcdir)/README $(srcdir)/COPYING $(srcdir)/Makefile.in \
 dtach: $(OBJ)
 	$(CC) -o $@ $(LDFLAGS) $(OBJ) $(LIBS)
 
+# The A19 replay gate: unit checks, then the end-to-end pty tests (python3).
+check: dtach
+	$(CC) $(CFLAGS) -o tests/gate_unit $(srcdir)/tests/gate_unit.c $(LIBS)
+	./tests/gate_unit
+	sh $(srcdir)/tests/replay_answerback.sh ./dtach
+	sh $(srcdir)/tests/replay_gate.sh ./dtach
+
 clean:
-	rm -f dtach $(OBJ) dtach-$(VERSION).tar.gz
+	rm -f dtach $(OBJ) dtach-$(VERSION).tar.gz tests/gate_unit
 
 distclean: clean
 	rm -f config.h Makefile config.log config.status config.cache

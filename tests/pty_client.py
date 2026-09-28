@@ -21,12 +21,20 @@ Actions:
                           throttled client finish a replay and move on
                           instead of idling out the rest of <secs>
   send:<text>             write <text> to the pty ("\\n" and "\\x1c" understood)
-  answer:<secs>           read for <secs> seconds like read:, but behave like a
+  answer:<secs>[:<delay>[:<dsr>]]
+                          read for <secs> seconds like read:, but behave like a
                           real terminal emulator (Terminal.app): every primary
                           device-attribute query (DA1, ESC [ c or ESC [ 0 c)
                           in the output is answered by writing ESC [ ? 1 ; 2 c
-                          back to the pty, replayed or not. The number of
-                          answers sent is appended to <outfile>.answers
+                          back to the pty, replayed or not, and every status
+                          query (DSR, ESC [ 5 n) by writing ESC [ 0 n. The
+                          number of DA1 answers sent is appended to
+                          <outfile>.answers. With <delay>, every answer is
+                          written <delay> seconds after its query was read,
+                          in order, like a terminal behind a slow link or
+                          renderer; answers still pending when <secs> runs out
+                          are written then. With <dsr> = 0 the terminal does
+                          not answer DSR at all
   detach                  send the dtach detach character (^\\, 0x1c)
 """
 import os
@@ -118,16 +126,29 @@ def trickle(limit, rate, idle=None):
 
 DA1_QUERIES = (b"\x1b[c", b"\x1b[0c")
 DA1_ANSWER = b"\x1b[?1;2c"
+DSR_QUERY = b"\x1b[5n"
+DSR_ANSWER = b"\x1b[0n"
 
 
-def answer(limit):
-    """Read for `limit` seconds, answering every DA1 query seen."""
+def answer(limit, delay=0.0, dsr=True):
+    """Read for `limit` seconds, answering every DA1 (and DSR) query seen."""
     start = time.time()
     tail = b""
     answered = 0
+    pending = []  # (due, bytes), in query order
+
+    def flush(everything):
+        while pending and (everything or pending[0][0] <= time.time()):
+            try:
+                os.write(fd, pending.pop(0)[1])
+            except OSError:
+                state["eof"] = True
+                return
+
     while not state["eof"] and time.time() - start < limit:
+        flush(False)
         try:
-            ready, _, _ = select.select([fd], [], [], 0.05)
+            ready, _, _ = select.select([fd], [], [], 0.02)
         except (OSError, ValueError):
             break
         if not ready:
@@ -142,16 +163,26 @@ def answer(limit):
             break
         out.write(data)
         # Keep a short tail so a query split across two reads is still seen,
-        # and count only queries that end inside the new data.
+        # and answer only queries that end inside the new data, in the order
+        # they appear.
         buf = tail + data
-        for q in DA1_QUERIES:
+        found = []
+        queries = [(q, DA1_ANSWER) for q in DA1_QUERIES]
+        if dsr:
+            queries.append((DSR_QUERY, DSR_ANSWER))
+        for q, reply in queries:
             idx = buf.find(q)
             while idx >= 0:
                 if idx + len(q) > len(tail):
-                    os.write(fd, DA1_ANSWER)
-                    answered += 1
+                    found.append((idx, reply))
                 idx = buf.find(q, idx + 1)
+        for _, reply in sorted(found, key=lambda f: f[0]):
+            pending.append((time.time() + delay, reply))
+            if reply == DA1_ANSWER:
+                answered += 1
         tail = buf[-3:]
+        flush(False)
+    flush(True)
     with open(outfile + ".answers", "a") as f:
         f.write("%d\n" % answered)
 
@@ -177,7 +208,10 @@ for action in actions:
     elif action.startswith("send:"):
         os.write(fd, unescape(action[len("send:"):]).encode())
     elif action.startswith("answer:"):
-        answer(float(action.split(":", 1)[1]))
+        parts = action.split(":")
+        answer(float(parts[1]),
+               delay=float(parts[2]) if len(parts) > 2 else 0.0,
+               dsr=(parts[3] != "0") if len(parts) > 3 else True)
     elif action == "detach":
         os.write(fd, b"\x1c")
     else:

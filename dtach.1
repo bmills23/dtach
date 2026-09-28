@@ -1,4 +1,4 @@
-.TH dtach 1 "May 2016" "dtach 0.9"
+.TH dtach 1 "September 2026" "dtach 0.9"
 .SH NAME
 dtach \- simple program that emulates the detach feature of screen.
 .SH SYNOPSIS
@@ -219,6 +219,61 @@ Normally,
 will suspend itself when the suspend key is pressed. With this option, the
 suspend character is sent to the session instead of being handled by
 .BR dtach .
+
+.PP
+.SH "REATTACHING AND TERMINAL QUERIES"
+The scrollback replayed on attach can hold queries a program once sent to
+its terminal (device attributes, cursor position, colours). A terminal
+emulator attached through
+.B dtach
+parses the replay as new output and answers those queries again, and those
+stale answers would reach the program as if typed.
+.B dtach
+therefore filters its own keyboard input around a replay it asked for.
+
+After a replay that carried any scrollback,
+.B dtach
+writes a device status query (ESC [ 5 n) to the terminal right after the
+replay. A terminal answers what it reads in order, so every answer to a
+replayed query arrives before the answer to that query, however slow the
+link or the terminal. From the start of the replay until that answer
+arrives, complete terminal reports on the input are dropped: ESC [ ... c,
+n, R, t, x, $ y and ESC [ ? ... u sequences, and DCS, OSC and APC strings.
+Nothing else is dropped. Typing, control keys such as Ctrl-C, arrows,
+function keys, mouse events, pastes, and the detach and suspend keys pass
+through throughout, and once the answer arrives everything passes, so a
+program that queries the terminal when a reattach redraws it (for example
+with
+.BR "\-r winch" )
+gets its answer.
+
+The costs, all bounded. Input starting with ESC can be held for up to
+100 milliseconds while
+.B dtach
+waits for the rest of a possible report, so a lone Escape key pressed during
+the window reaches the program that much later. A key whose encoding has the
+shape of a report is dropped inside the window: xterm-style terminals send
+ESC [ 1 ; <modifier> R for a modified F3, which is indistinguishable from a
+cursor position report. A program's query asked after the replay is answered after the
+status query, so its answer passes; it is lost only when the window has to
+close on a timer instead. If the terminal never answers the status query,
+the window closes 5 seconds after the replay plus one second per 64 KB
+replayed, and one late ESC [ 0 n is still discarded for 30 seconds after
+that. A replay whose end is never seen (the scrollback held a nested start
+marker with no end) closes 30 seconds after it began plus the same per-size
+allowance. A terminal answerback string (the reply to ENQ) is not
+recognised as a report and is not filtered.
+
+The replay markers and the status query are ordinary escape sequences that
+terminals ignore or answer silently. A replay marker that a program prints
+itself never opens this window, since
+.B dtach
+only honours the replay that follows its own attach request. Nothing is
+filtered when the replay is empty, which includes the client that creates a
+session with
+.B \-c
+or
+.BR \-A .
 
 .PP
 .SH EXAMPLES
