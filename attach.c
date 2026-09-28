@@ -430,6 +430,23 @@ strip_output(struct marker_strip *st, const unsigned char *buf, size_t len,
 	return o;
 }
 
+/*
+** The notice this client prints when the master drops it mid-replay. The
+** marker tells a parsing client that the replay ended; a terminal that asked
+** for stripping has no such parser, so it gets the text alone.
+*/
+static const char *
+replay_abort_notice(const struct marker_strip *st)
+{
+#define ABORT_TEXT "[reattach interrupted - the session is still running, " \
+	"attach again]\r\n"
+	static const char marked[] = "\033]dtach-rev;replay-abort\007"
+		ABORT_TEXT;
+
+	return st->enabled ? ABORT_TEXT : marked;
+#undef ABORT_TEXT
+}
+
 /* The stream is ending: whatever is held was data, write it. */
 static void
 strip_flush(struct marker_strip *st)
@@ -942,11 +959,8 @@ attach_main(int noerror)
 				** us, but the session is still running. */
 				if (gate.depth > 0)
 				{
-					printf(EOS "\r\n"
-					       "\033]dtach-rev;replay-abort\007"
-					       "[reattach interrupted - the "
-					       "session is still running, "
-					       "attach again]\r\n");
+					printf(EOS "\r\n%s",
+					       replay_abort_notice(&strip));
 					exit(1);
 				}
 				printf(EOS "\r\n[EOF - dtach terminating]"

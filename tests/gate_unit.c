@@ -3,7 +3,8 @@
 ** across reads at every byte, multi-chunk replays, nesting and replay-abort,
 ** forged markers in live output, the DSR fence and its counting, the input
 ** report filter (split at every byte), holds and every time bound, and the
-** opt-in replay marker stripping on the terminal side (split at every byte).
+** opt-in replay marker stripping on the terminal side (split at every byte,
+** with no byte held past a diverging one), and the client's abort notice.
 **
 ** Build and run from the source directory, after ./configure && make:
 **   cc -I. -o tests/gate_unit tests/gate_unit.c && tests/gate_unit
@@ -193,17 +194,80 @@ expect_out(const char *what, const unsigned char *out, size_t n,
 }
 
 /*
+** How many trailing bytes of p[0..n) a correct stripper still holds: the
+** longest suffix that starts with ESC and is a proper prefix of a marker.
+** Every marker starts with ESC and holds no other ESC, so that suffix is
+** exactly the pending hold.
+*/
+static size_t
+pending_len(const unsigned char *p, size_t n)
+{
+	size_t j;
+	int whole;
+
+	for (j = n; j-- > 0; )
+		if (p[j] == 0x1b && strip_match(p + j, n - j, &whole) && !whole)
+			return n - j;
+	return 0;
+}
+
+/*
+** What the terminal should have seen for input p[0..n) with no pending
+** tail: the input with every complete marker removed when stripping is on,
+** and the fence after an end marker when a replay was expected. Independent
+** of strip_output, so a stripper that sits on released bytes cannot pass.
+*/
+static size_t
+oracle(const unsigned char *p, size_t n, int expect, int enabled,
+       unsigned char *out)
+{
+	const char *m[3] = { START, END, ABORT };
+	size_t i = 0, o = 0;
+	int k;
+
+	while (i < n)
+	{
+		for (k = 0; k < 3; ++k)
+		{
+			size_t ml = strlen(m[k]);
+
+			if (i + ml <= n && memcmp(p + i, m[k], ml) == 0)
+				break;
+		}
+		if (k == 3)
+		{
+			out[o++] = p[i++];
+			continue;
+		}
+		if (!enabled)
+		{
+			memcpy(out + o, m[k], strlen(m[k]));
+			o += strlen(m[k]);
+		}
+		i += strlen(m[k]);
+		if (k == 1 && expect)
+		{
+			memcpy(out + o, "\033[5n", 4);
+			o += 4;
+		}
+	}
+	return o;
+}
+
+/*
 ** Feed stream[] through emit_output (the terminal side of attach_main) in
 ** two reads split at `cut`, then flush as the EOF path does. Returns 1 if
-** the terminal received exactly `want` (want_len bytes), and, when
-** `check_first` is set, if what reached it after the first read was a
-** prefix of `want` (no marker fragment was written early).
+** the terminal received exactly `want` (want_len bytes), and if what
+** reached it after the first read was exactly the oracle's output for that
+** read up to its pending marker prefix: no marker fragment written early,
+** and nothing else held back for a later ESC or the flush.
 */
 static int
 emit2(int expect, int enabled, size_t cut, const char *want, size_t want_len)
 {
+	static unsigned char first_want[sizeof(stream) + 64];
 	struct replay_gate g;
-	size_t first;
+	size_t first, fw;
 
 	fresh(&g, expect);
 	memset(&strip, 0, sizeof(strip));
@@ -213,10 +277,13 @@ emit2(int expect, int enabled, size_t cut, const char *want, size_t want_len)
 		cut = stream_len;
 	emit_output(&g, &strip, stream, cut, 1000);
 	first = term_len;
+	fw = oracle(stream, cut - (enabled ? pending_len(stream, cut) : 0),
+		    expect, enabled, first_want);
+	if (first != fw || memcmp(term, first_want, fw) != 0)
+		return 0;
 	emit_output(&g, &strip, stream + cut, stream_len - cut, 1000);
 	strip_flush(&strip);
-	return first <= want_len && memcmp(term, want, first) == 0 &&
-		term_len == want_len && memcmp(term, want, want_len) == 0;
+	return term_len == want_len && memcmp(term, want, want_len) == 0;
 }
 
 /* Run emit2 at every split point and check the result. */
@@ -610,6 +677,43 @@ main(void)
 		s_add(other, sizeof(other) - 1);
 		emit_every_split("other bytes and lookalikes pass byte for byte",
 				 0, 1, other, sizeof(other) - 1);
+
+		{
+			/* A prompt after an escape sequence is not held. */
+			static const unsigned char prompt[] = "\033[0m$ ";
+			unsigned char out[sizeof(prompt) + 32];
+			size_t n;
+
+			memset(&strip, 0, sizeof(strip));
+			strip.enabled = 1;
+			n = strip_output(&strip, prompt, sizeof(prompt) - 1,
+					 out);
+			CHECK(strip.held_len == 0, "prompt: nothing held");
+			expect_out("prompt released without a flush", out, n,
+				   (const char *)prompt);
+		}
+
+		{
+			/* The client's own abort notice: marker only for
+			** parsers, text alone when stripping is on. */
+			static const char text[] = "[reattach interrupted - "
+				"the session is still running, attach again]"
+				"\r\n";
+			char marked[160];
+			const char *on, *off;
+
+			snprintf(marked, sizeof(marked), "%s%s", ABORT, text);
+			memset(&strip, 0, sizeof(strip));
+			strip.enabled = 1;
+			on = replay_abort_notice(&strip);
+			strip.enabled = 0;
+			off = replay_abort_notice(&strip);
+			expect_out("abort notice, stripping on: no marker",
+				   (const unsigned char *)on, strlen(on), text);
+			expect_out("abort notice, stripping off: marker kept",
+				   (const unsigned char *)off, strlen(off),
+				   marked);
+		}
 
 		s_reset();
 		S_ADD(START);

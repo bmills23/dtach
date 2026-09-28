@@ -289,10 +289,11 @@ terminal whose parser does not recognise them may print part of one (for
 example "tach-rev;replay-end"). Set it when a person, not a program, reads
 the terminal. Only this client's output changes: the input filtering
 described above and its status query are the same either way. A marker
-split across reads is held, at most one marker length, until the next read
-shows whether it is one; bytes that are not a marker pass unchanged. The
-replay-abort notice this client prints itself when a replay is cut short
-keeps its marker, so an outer parser still sees the replay end.
+split across reads is held, at most one marker length minus one byte, until
+the next read shows whether it is one; bytes that are not a marker pass
+unchanged. The notice this client prints itself when a replay is cut short
+carries the replay-abort marker only when this variable is not set, so a
+parsing client still sees the replay end and a person sees the text alone.
 
 .PP
 .SH EXAMPLES
