@@ -48,43 +48,116 @@ static const char replay_end_marker[] = "\033]dtach-rev;replay-end\007";
 static int in_replay;
 
 /*
-** Advance a naive matcher for `marker` over `len` bytes, returning 1 if the
-** marker completed somewhere in them. The match state lives in *pos across
-** calls, so a marker split across two reads is still seen.
+** Advance a naive matcher for `marker` by one byte, returning 1 if the marker
+** completed on it. The match state lives in *pos across calls, so a marker
+** split across two reads is still seen.
 */
 static int
-scan_marker(const char *marker, size_t *pos, const unsigned char *buf,
-	    size_t len)
+marker_step(const char *marker, size_t *pos, unsigned char c)
 {
-	size_t i;
-	int matched = 0;
-
-	for (i = 0; i < len; ++i)
+	if (c == (unsigned char)marker[*pos])
 	{
-		if (buf[i] == (unsigned char)marker[*pos])
+		if (marker[++(*pos)] == '\0')
 		{
-			if (marker[++(*pos)] == '\0')
-			{
-				matched = 1;
-				*pos = 0;
-			}
+			*pos = 0;
+			return 1;
 		}
-		else
-			*pos = (buf[i] == (unsigned char)marker[0]) ? 1 : 0;
+		return 0;
 	}
-	return matched;
+	*pos = (c == (unsigned char)marker[0]) ? 1 : 0;
+	return 0;
 }
 
-/* Note the replay markers in a chunk of data received from the master. */
-static void
+/*
+** A19: stale answers to replayed terminal queries.
+**
+** The replayed scrollback can hold terminal queries (DA1 "ESC [ c", cursor
+** position reports and the like) that a program asked long ago and that were
+** answered, live, back then. A full terminal emulator attached through this
+** client (Terminal.app, via TerminaLLM's "Open Tab on Mac") parses the replay
+** as if it were new and answers those queries again, and the answers used to
+** be forwarded to the session as keystrokes, corrupting the next command.
+**
+** So keyboard input is dropped while a replay that carries data is streaming,
+** and for REPLAY_INPUT_GRACE_MS after its replay-end marker has been written
+** to the terminal. The replayed bytes still render, and a query issued after
+** the window gets its answer forwarded as before. The detach and suspend keys
+** still work while input is dropped.
+**
+** Nothing is dropped after an empty replay (no scrollback, or nothing
+** printed yet). That includes the client that creates a session with -c or
+** -A: the master does not read the pty until that client is attached
+** (waitattach in master_process), so its replay is always empty and any
+** query the program asks at startup is answered and forwarded as before.
+** This mirrors replay_gate.go in terminallm-daemon.
+*/
+#define REPLAY_INPUT_GRACE_MS 500
+/* Bytes received since the last replay-start, the end marker included. */
+static size_t replay_bytes;
+/* Monotonic ms before which keyboard input is dropped; 0 when not armed. */
+static long long input_quiet_until;
+
+#define REPLAY_END_LEN (sizeof(replay_end_marker) - 1)
+
+/* Milliseconds from a clock that never steps backwards when one exists. */
+static long long
+now_ms(void)
+{
+	struct timeval tv;
+#ifdef CLOCK_MONOTONIC
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+		return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+	gettimeofday(&tv, NULL);
+	return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/*
+** Note the replay markers in a chunk of data received from the master.
+** Returns 1 if a replay that carried data ended in this chunk, so the caller
+** arms the input grace window once the chunk has reached the terminal.
+*/
+static int
 track_replay(const unsigned char *buf, size_t len)
 {
 	static size_t start_pos, end_pos;
+	int ended_with_data = 0;
+	size_t i;
 
-	if (scan_marker(replay_start_marker, &start_pos, buf, len))
-		in_replay = 1;
-	if (scan_marker(replay_end_marker, &end_pos, buf, len))
-		in_replay = 0;
+	for (i = 0; i < len; ++i)
+	{
+		int started = marker_step(replay_start_marker, &start_pos,
+					  buf[i]);
+		int ended = marker_step(replay_end_marker, &end_pos, buf[i]);
+
+		if (in_replay)
+			++replay_bytes;
+		if (started)
+		{
+			in_replay = 1;
+			replay_bytes = 0;
+		}
+		else if (ended)
+		{
+			if (in_replay && replay_bytes > REPLAY_END_LEN)
+				ended_with_data = 1;
+			in_replay = 0;
+		}
+	}
+	return ended_with_data;
+}
+
+/* 1 if keyboard input should be dropped right now; see the A19 comment. */
+static int
+replay_input_blocked(void)
+{
+	/* Mid-replay, once at least one byte of replayed data has arrived:
+	** only then can replay_bytes reach REPLAY_END_LEN with no end yet. */
+	if (in_replay && replay_bytes >= REPLAY_END_LEN)
+		return 1;
+	return input_quiet_until != 0 && now_ms() < input_quiet_until;
 }
 
 /* Restores the original terminal settings. */
@@ -303,6 +376,7 @@ attach_main(int noerror)
 		if (n > 0 && FD_ISSET(s, &readfds))
 		{
 			ssize_t len = read(s, buf, sizeof(buf));
+			int arm;
 
 			if (len == 0)
 			{
@@ -327,8 +401,11 @@ attach_main(int noerror)
 				exit(1);
 			}
 			/* Send the data to the terminal. */
-			track_replay(buf, (size_t)len);
+			arm = track_replay(buf, (size_t)len);
 			write_buf_or_fail(1, buf, len);
+			if (arm)
+				input_quiet_until = now_ms() +
+					REPLAY_INPUT_GRACE_MS;
 			n--;
 		}
 		/* stdin activity */
@@ -344,7 +421,14 @@ attach_main(int noerror)
 				exit(1);
 
 			pkt.len = len;
-			process_kbd(s, &pkt);
+			/* Drop what is most likely the terminal answering a
+			** replayed query (A19), but never the local detach or
+			** suspend key. */
+			if (!replay_input_blocked() ||
+			    pkt.u.buf[0] == detach_char ||
+			    (!no_suspend &&
+			     pkt.u.buf[0] == cur_term.c_cc[VSUSP]))
+				process_kbd(s, &pkt);
 			n--;
 		}
 

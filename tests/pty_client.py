@@ -21,6 +21,12 @@ Actions:
                           throttled client finish a replay and move on
                           instead of idling out the rest of <secs>
   send:<text>             write <text> to the pty ("\\n" and "\\x1c" understood)
+  answer:<secs>           read for <secs> seconds like read:, but behave like a
+                          real terminal emulator (Terminal.app): every primary
+                          device-attribute query (DA1, ESC [ c or ESC [ 0 c)
+                          in the output is answered by writing ESC [ ? 1 ; 2 c
+                          back to the pty, replayed or not. The number of
+                          answers sent is appended to <outfile>.answers
   detach                  send the dtach detach character (^\\, 0x1c)
 """
 import os
@@ -110,6 +116,46 @@ def trickle(limit, rate, idle=None):
             time.sleep(remaining)
 
 
+DA1_QUERIES = (b"\x1b[c", b"\x1b[0c")
+DA1_ANSWER = b"\x1b[?1;2c"
+
+
+def answer(limit):
+    """Read for `limit` seconds, answering every DA1 query seen."""
+    start = time.time()
+    tail = b""
+    answered = 0
+    while not state["eof"] and time.time() - start < limit:
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.05)
+        except (OSError, ValueError):
+            break
+        if not ready:
+            continue
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            state["eof"] = True
+            break
+        if not data:
+            state["eof"] = True
+            break
+        out.write(data)
+        # Keep a short tail so a query split across two reads is still seen,
+        # and count only queries that end inside the new data.
+        buf = tail + data
+        for q in DA1_QUERIES:
+            idx = buf.find(q)
+            while idx >= 0:
+                if idx + len(q) > len(tail):
+                    os.write(fd, DA1_ANSWER)
+                    answered += 1
+                idx = buf.find(q, idx + 1)
+        tail = buf[-3:]
+    with open(outfile + ".answers", "a") as f:
+        f.write("%d\n" % answered)
+
+
 def unescape(text):
     return text.replace("\\n", "\n").replace("\\r", "\r").replace("\\x1c", "\x1c")
 
@@ -130,6 +176,8 @@ for action in actions:
         trickle(limit, rate, idle=float(parts[3]) if len(parts) > 3 else None)
     elif action.startswith("send:"):
         os.write(fd, unescape(action[len("send:"):]).encode())
+    elif action.startswith("answer:"):
+        answer(float(action.split(":", 1)[1]))
     elif action == "detach":
         os.write(fd, b"\x1c")
     else:
