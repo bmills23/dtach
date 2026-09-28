@@ -325,6 +325,163 @@ gate_fence_sent(struct replay_gate *g, long long now)
 	g->owed_until = g->fence_deadline + GATE_LATE_PROBE_MS;
 }
 
+/*
+** Replay marker stripping (opt-in, DTACH_REV_STRIP_MARKERS=1).
+**
+** The replay markers are a protocol between the master and a client that
+** parses them (TerminaLLM reads them from this client's output to find the
+** replay), so by default they pass through untouched. A human terminal has
+** no use for them, and one whose OSC parser gives up on a non-numeric
+** selector (the Linux console's ESC ] handling, for one) consumes ESC ] d
+** and prints the rest: "tach-rev;replay-end". With
+** DTACH_REV_STRIP_MARKERS=1 in the environment, complete start, end and
+** abort markers are removed from what this client writes to the terminal.
+** gate_output still sees every raw byte, so the gate, its fence and input
+** filtering are unchanged.
+**
+** A marker can be split across reads, so a trailing prefix of one is held
+** until the next read decides it. The hold is at most one marker length
+** minus one byte, and only while the held bytes are still a prefix of a
+** marker; every marker starts with ESC and holds no other ESC, so held bytes
+** are an unterminated ESC or OSC a terminal would not render before its
+** next byte anyway. Held bytes that turn out not to be a marker are written
+** unchanged and in order, and strip_flush writes whatever is still held when
+** the stream ends.
+*/
+struct marker_strip
+{
+	int enabled;
+	unsigned char held[MARKER_LEN(replay_abort_marker)];
+	size_t held_len;
+};
+
+static struct marker_strip strip;
+
+/* 1 if held[0..n) is a prefix of a marker; *whole set if it is one. */
+static int
+strip_match(const unsigned char *held, size_t n, int *whole)
+{
+	const char *markers[3];
+	int k, prefix = 0;
+
+	markers[0] = replay_start_marker;
+	markers[1] = replay_end_marker;
+	markers[2] = replay_abort_marker;
+	*whole = 0;
+	for (k = 0; k < 3; ++k)
+	{
+		size_t mlen = strlen(markers[k]);
+
+		if (n <= mlen && memcmp(markers[k], held, n) == 0)
+		{
+			prefix = 1;
+			if (n == mlen)
+				*whole = 1;
+		}
+	}
+	return prefix;
+}
+
+/*
+** Copy buf to out with every complete marker removed, resolving any held
+** prefix first. out must have room for len + sizeof(st->held) bytes.
+** Returns the number of bytes written to out.
+*/
+static size_t
+strip_output(struct marker_strip *st, const unsigned char *buf, size_t len,
+	     unsigned char *out)
+{
+	size_t i, o = 0;
+
+	for (i = 0; i < len; ++i)
+	{
+		unsigned char c = buf[i];
+		int whole;
+
+		if (st->held_len == 0)
+		{
+			if (c == 0x1b)
+				st->held[st->held_len++] = c;
+			else
+				out[o++] = c;
+			continue;
+		}
+		if (st->held_len < sizeof(st->held))
+		{
+			st->held[st->held_len] = c;
+			if (strip_match(st->held, st->held_len + 1, &whole))
+			{
+				if (whole)
+					st->held_len = 0;
+				else
+					++st->held_len;
+				continue;
+			}
+		}
+		/* Not a marker: release what was held. This byte may start one. */
+		memcpy(out + o, st->held, st->held_len);
+		o += st->held_len;
+		st->held_len = 0;
+		if (c == 0x1b)
+			st->held[st->held_len++] = c;
+		else
+			out[o++] = c;
+	}
+	return o;
+}
+
+/* The stream is ending: whatever is held was data, write it. */
+static void
+strip_flush(struct marker_strip *st)
+{
+	if (st->held_len != 0)
+		write_buf_or_fail(1, st->held, st->held_len);
+	st->held_len = 0;
+}
+
+/*
+** Send data from the master to the terminal, with the A19 fence right after
+** a replay that carried data, and with the replay markers removed when
+** stripping is on.
+*/
+static void
+emit_output(struct replay_gate *g, struct marker_strip *st,
+	    const unsigned char *buf, size_t len, long long now)
+{
+	unsigned char sbuf[BUFSIZE + sizeof(st->held)];
+	size_t off;
+
+	for (off = 0; off < len; )
+	{
+		size_t cut = gate_output(g, buf + off, len - off, now);
+
+		if (!st->enabled)
+			write_buf_or_fail(1, buf + off, cut);
+		else
+		{
+			/* Split so sbuf always has room for cut + held. */
+			size_t done = 0;
+
+			while (done < cut)
+			{
+				size_t n = cut - done;
+
+				if (n > BUFSIZE)
+					n = BUFSIZE;
+				write_buf_or_fail(1, sbuf, strip_output(st,
+					buf + off + done, n, sbuf));
+				done += n;
+			}
+		}
+		off += cut;
+		if (g->probe_due)
+		{
+			write_buf_or_fail(1, dsr_query, MARKER_LEN(dsr_query));
+			gate_fence_sent(g, now);
+		}
+	}
+}
+
 #define SEQ_TEXT	0	/* forward the first byte as is */
 #define SEQ_KEY		1	/* a complete sequence that is not a report */
 #define SEQ_ANSWER	2	/* a complete terminal report */
@@ -711,6 +868,13 @@ attach_main(int noerror)
 	signal(SIGQUIT, die);
 	signal(SIGWINCH, win_change);
 
+	/* Keep the replay markers off a human terminal (see strip_output). */
+	{
+		const char *e = getenv("DTACH_REV_STRIP_MARKERS");
+
+		strip.enabled = e && strcmp(e, "1") == 0;
+	}
+
 	/* Set raw mode. */
 	cur_term.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL);
 	cur_term.c_iflag &= ~(IXON|IXOFF);
@@ -770,10 +934,10 @@ attach_main(int noerror)
 		if (n > 0 && FD_ISSET(s, &readfds))
 		{
 			ssize_t len = read(s, buf, sizeof(buf));
-			size_t off;
 
 			if (len == 0)
 			{
+				strip_flush(&strip);
 				/* Cut off mid-replay: the master dropped
 				** us, but the session is still running. */
 				if (gate.depth > 0)
@@ -791,26 +955,13 @@ attach_main(int noerror)
 			}
 			else if (len < 0)
 			{
+				strip_flush(&strip);
 				printf(EOS "\r\n[read returned an error]\r\n");
 				exit(1);
 			}
 			/* Send the data to the terminal, with the A19 fence
 			** right after a replay that carried data. */
-			for (off = 0; off < (size_t)len; )
-			{
-				size_t cut = gate_output(&gate, buf + off,
-							 (size_t)len - off,
-							 now_ms());
-
-				write_buf_or_fail(1, buf + off, cut);
-				off += cut;
-				if (gate.probe_due)
-				{
-					write_buf_or_fail(1, dsr_query,
-						MARKER_LEN(dsr_query));
-					gate_fence_sent(&gate, now_ms());
-				}
-			}
+			emit_output(&gate, &strip, buf, (size_t)len, now_ms());
 			n--;
 		}
 		/* stdin activity */

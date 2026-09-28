@@ -276,6 +276,25 @@ or
 .BR \-A .
 
 .PP
+.SH ENVIRONMENT
+.TP
+.B DTACH_REV_STRIP_MARKERS
+When set to
+.BR 1 ,
+the attaching client removes the replay-start, replay-end and replay-abort
+markers from what it writes to the terminal. The markers are a protocol for
+programs that parse this client's output to find the replay, so they pass
+through by default. A person reading a terminal has no use for them, and a
+terminal whose parser does not recognise them may print part of one (for
+example "tach-rev;replay-end"). Set it when a person, not a program, reads
+the terminal. Only this client's output changes: the input filtering
+described above and its status query are the same either way. A marker
+split across reads is held, at most one marker length, until the next read
+shows whether it is one; bytes that are not a marker pass unchanged. The
+replay-abort notice this client prints itself when a replay is cut short
+keeps its marker, so an outer parser still sees the replay end.
+
+.PP
 .SH EXAMPLES
 
 The following example creates a new session that has the detach character

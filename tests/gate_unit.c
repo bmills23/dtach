@@ -2,7 +2,8 @@
 ** Unit test for the A19 replay gate in attach.c: the replay markers split
 ** across reads at every byte, multi-chunk replays, nesting and replay-abort,
 ** forged markers in live output, the DSR fence and its counting, the input
-** report filter (split at every byte), holds and every time bound.
+** report filter (split at every byte), holds and every time bound, and the
+** opt-in replay marker stripping on the terminal side (split at every byte).
 **
 ** Build and run from the source directory, after ./configure && make:
 **   cc -I. -o tests/gate_unit tests/gate_unit.c && tests/gate_unit
@@ -19,10 +20,18 @@ size_t scrollback_size;
 int idle_timeout;
 char *idle_callback;
 
+/* What emit_output wrote to the terminal (fd 1). */
+static unsigned char term[400000];
+static size_t term_len;
+
 void
 write_buf_or_fail(int fd, const void *buf, size_t count)
 {
-	(void)fd; (void)buf; (void)count;
+	if (fd == 1 && term_len + count <= sizeof(term))
+	{
+		memcpy(term + term_len, buf, count);
+		term_len += count;
+	}
 }
 
 void
@@ -181,6 +190,68 @@ expect_out(const char *what, const unsigned char *out, size_t n,
 	CHECK(ok, what);
 	if (ok)
 		printf("   PASS: %s\n", what);
+}
+
+/*
+** Feed stream[] through emit_output (the terminal side of attach_main) in
+** two reads split at `cut`, then flush as the EOF path does. Returns 1 if
+** the terminal received exactly `want` (want_len bytes), and, when
+** `check_first` is set, if what reached it after the first read was a
+** prefix of `want` (no marker fragment was written early).
+*/
+static int
+emit2(int expect, int enabled, size_t cut, const char *want, size_t want_len)
+{
+	struct replay_gate g;
+	size_t first;
+
+	fresh(&g, expect);
+	memset(&strip, 0, sizeof(strip));
+	strip.enabled = enabled;
+	term_len = 0;
+	if (cut > stream_len)
+		cut = stream_len;
+	emit_output(&g, &strip, stream, cut, 1000);
+	first = term_len;
+	emit_output(&g, &strip, stream + cut, stream_len - cut, 1000);
+	strip_flush(&strip);
+	return first <= want_len && memcmp(term, want, first) == 0 &&
+		term_len == want_len && memcmp(term, want, want_len) == 0;
+}
+
+/* Run emit2 at every split point and check the result. */
+static void
+emit_every_split(const char *what, int expect, int enabled, const char *want,
+		 size_t want_len)
+{
+	size_t cut;
+	int bad = 0;
+
+	for (cut = 0; cut <= stream_len; ++cut)
+		if (!emit2(expect, enabled, cut, want, want_len))
+			bad = 1;
+	CHECK(!bad, what);
+	if (!bad)
+		printf("   PASS: %s\n", what);
+}
+
+/* 1 if the terminal output holds any part of a marker's name. */
+static int
+term_has_marker_bytes(void)
+{
+	static const char *bad[] = { "dtach-rev", "tach-rev;replay",
+		"replay-start", "replay-end", "replay-abort", "\033]d" };
+	size_t k, i;
+
+	for (k = 0; k < sizeof(bad) / sizeof(bad[0]); ++k)
+	{
+		size_t n = strlen(bad[k]);
+
+		for (i = 0; i + n <= term_len; ++i)
+			if (memcmp(term + i, bad[k], n) == 0)
+				return 1;
+	}
+	return 0;
 }
 
 int
@@ -486,6 +557,74 @@ main(void)
 
 	fresh(&g, 0);
 	CHECK(!gate_input_needed(&g, 1000), "no replay: input path unchanged");
+
+	printf("== terminal side: replay marker stripping (opt-in) ==\n");
+	{
+		static const char strip_want[] =
+			"scroll\033[1mback\033[5nlive";
+		static const char other[] =
+			"plain\033]0;title\007\033]8;;https://x.test\033\\link"
+			"\033]8;;\033\\\033[?2026h\033[2J\033\033]dtach-rev;"
+			"replay-x\007\033]dtach-rev;other\007\033]dtach-rev;"
+			"replay-en\033[0m\342\224\200\033]dtach-rev;replay-sta";
+
+		s_reset();
+		S_ADD(START);
+		S_ADD("scroll\033[1mback");
+		S_ADD(END);
+		S_ADD("live");
+		emit_every_split("stripped: no marker, fence kept, any split",
+				 GATE_EXPECT_FIRST, 1, strip_want,
+				 strlen(strip_want));
+		emit2(GATE_EXPECT_FIRST, 1, 7, strip_want, strlen(strip_want));
+		CHECK(!term_has_marker_bytes(), "no marker fragment reached "
+		      "the terminal");
+		{
+			/* Byte by byte, as reads of one. */
+			struct replay_gate bg;
+			size_t i;
+
+			fresh(&bg, GATE_EXPECT_FIRST);
+			memset(&strip, 0, sizeof(strip));
+			strip.enabled = 1;
+			term_len = 0;
+			for (i = 0; i < stream_len; ++i)
+				emit_output(&bg, &strip, stream + i, 1, 1000);
+			strip_flush(&strip);
+			expect_out("stripped byte by byte", term, term_len,
+				   strip_want);
+		}
+
+		s_reset();
+		S_ADD("a");
+		S_ADD(START);
+		S_ADD("b");
+		S_ADD(ABORT);
+		S_ADD("c");
+		S_ADD(END);
+		S_ADD("d");
+		emit_every_split("live start, abort and end markers stripped",
+				 0, 1, "abcd", 4);
+
+		s_reset();
+		s_add(other, sizeof(other) - 1);
+		emit_every_split("other bytes and lookalikes pass byte for byte",
+				 0, 1, other, sizeof(other) - 1);
+
+		s_reset();
+		S_ADD(START);
+		S_ADD("scroll");
+		S_ADD(END);
+		{
+			char keep[128];
+
+			snprintf(keep, sizeof(keep), "%sscroll%s\033[5n",
+				 START, END);
+			emit_every_split("not enabled: markers kept for parsers",
+					 GATE_EXPECT_FIRST, 0, keep,
+					 strlen(keep));
+		}
+	}
 
 	if (failures)
 	{

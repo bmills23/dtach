@@ -17,6 +17,7 @@ The following modifications were made to the original dtach v0.9:
 - **Scrollback buffer** (`master.c`): A circular buffer (default 256KB) captures all PTY output. When a client attaches, the buffer contents are replayed so the client has session context.
 - **OSC-delimited replay** (`master.c`): Replayed content is wrapped in `\033]dtach-rev;replay-start\007` / `\033]dtach-rev;replay-end\007` OSC sequences so smart clients can distinguish replayed content from live output.
 - **Replay answer gate** (`attach.c`): A terminal emulator that reattaches parses the replay and answers queries in it (device attributes, cursor position) that were answered long ago. After a replay it asked for, the attach client writes a status query (`ESC [ 5 n`) as a fence and drops terminal reports on its input until the fence is answered; keystrokes always pass. See "REATTACHING AND TERMINAL QUERIES" in `dtach.1`.
+- **Replay marker stripping** (`attach.c`): With `DTACH_REV_STRIP_MARKERS=1`, the attach client removes the replay markers from what it writes to the terminal, for a terminal a person reads (a parser that does not recognise them can print part of one, like `tach-rev;replay-end`). Off by default, since parsing clients need the markers. See ENVIRONMENT in `dtach.1`.
 - **`-b` flag** (`main.c`): Configurable scrollback buffer size at runtime. Supports K/M suffixes (e.g., `-b 512K`, `-b 1M`). Set to `0` to disable.
 - **Header updates** (`dtach.h`): Added `scrollback_size` global, `DEFAULT_SCROLLBACK_SIZE` constant, and `MSG_CONTENT` enum value.
 
